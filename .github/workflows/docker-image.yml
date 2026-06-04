@@ -9,6 +9,7 @@ on:
       - '.github/workflows/docker-image.yml'
       - 'EXTRACTION/**'
       - 'INGESTION/**'
+  workflow_dispatch:
 
 
 env:
