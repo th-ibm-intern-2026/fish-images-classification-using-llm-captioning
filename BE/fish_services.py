@@ -6,9 +6,18 @@ from groq import Groq
 import requests
 import http.client
 from typing import Dict, Any, Optional
-from fish_constants import SYSTEM_CONTENT_SINGLE, MODEL_ID
+from fish_constants import SYSTEM_CONTENT_SINGLE, MODEL_ID, PHYSICAL_FEATURE_FIELDS
 from google import genai
 from google.genai import types
+
+# Shared instruction for every provider: read the specimen with the same structured
+# template that authored the reference descriptions, then compare field-by-field.
+IDENTIFY_USER_PROMPT = (
+    "Identify the fish. First read the specimen using the structured feature template "
+    "(" + ", ".join(PHYSICAL_FEATURE_FIELDS) + "), record it in observed_features, then "
+    "compare those fields against the reference descriptions and return JSON with the "
+    "Top 5 candidates whose score_reason cites the matching/conflicting fields."
+)
 
 def get_watsonx_token(api_key: str, iam_url: str) -> Optional[str]:
     try:
@@ -45,7 +54,7 @@ def identify_fish_candidates(pic_string: str, access_token: str, project_id: str
             {
                 "role": "user", 
                 "content": [
-                    {"type": "text", "text": "Identify the fish. Return JSON with Top 5 candidates."},
+                    {"type": "text", "text": IDENTIFY_USER_PROMPT},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{pic_string}"}}
                 ]
             }
@@ -108,7 +117,7 @@ def identify_fish_candidates_gemini(client: genai.Client, pic_string: str) -> Op
                   data=image_bytes,
                   mime_type="image/jpeg"
                 ),
-                'Identify the fish in this image'
+                IDENTIFY_USER_PROMPT
             ],
             config=config
         )
@@ -136,19 +145,34 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
         type=types.Type.OBJECT,
         properties={
             "fish_name": types.Schema(
-                type=types.Type.STRING, 
+                type=types.Type.STRING,
                 description="Must be exactly one from the allowed species list."
             ),
             "score": types.Schema(
-                type=types.Type.NUMBER, 
+                type=types.Type.NUMBER,
                 description="Confidence score between 0.0 and 1.0"
             ),
             "score_reason": types.Schema(
-                type=types.Type.STRING, 
-                description="Brief explanation of visual features matching the description."
+                type=types.Type.STRING,
+                description="Name the observed_features fields that matched or conflicted with this species' reference description."
             )
         },
         required=["fish_name", "score", "score_reason"]
+    )
+
+    # The specimen as read from the image, using the SAME field template
+    # (PHYSICAL_FEATURE_FIELDS) that authored the reference descriptions, so the
+    # model compares like-for-like instead of matching on loose impressions.
+    observed_features_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            field: types.Schema(
+                type=types.Type.STRING,
+                description='Observed value from the image, or "not visible".'
+            )
+            for field in PHYSICAL_FEATURE_FIELDS
+        },
+        description="Structured reading of the specimen in the reference template.",
     )
 
     # Schema หลักของ JSON Response
@@ -156,14 +180,15 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
         type=types.Type.OBJECT,
         properties={
             "image_contains_fish": types.Schema(
-                type=types.Type.BOOLEAN, 
+                type=types.Type.BOOLEAN,
                 description="True only if valid, raw/fresh fish is detected."
             ),
             "rejection_reason": types.Schema(
-                type=types.Type.STRING, 
+                type=types.Type.STRING,
                 description="Reason if image_contains_fish is false, otherwise null.",
                 nullable=True # อนุญาตให้เป็น null ได้
             ),
+            "observed_features": observed_features_schema,
             "results": types.Schema(
                 type=types.Type.ARRAY,
                 items=candidate_schema,
@@ -202,14 +227,12 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
                     data=image_bytes,
                     mime_type="image/webp"
                 ),
-                # ย้ำ Prompt สั้นๆ อีกครั้งเพื่อให้ AI เริ่มทำงาน
-                'Analyze the image. Return JSON according to the schema.'
+                IDENTIFY_USER_PROMPT
             ],
             config=config
         )
         
         # Parse Response
-        # เพราะเราใช้ schema + application/json จึงมั่นใจได้ว่า text เป็น json แน่นอน
         if response.text:
             try:
                 # 1. แปลง String เป็น Python Dict
@@ -255,8 +278,8 @@ def identify_fish_candidates_groq(client: Groq, pic_string: str) -> Optional[Dic
                     "role": "user",
                     "content": [
                         {
-                            "type": "text", 
-                            "text": "Identify the fish. Return JSON with Top 5 candidates."
+                            "type": "text",
+                            "text": IDENTIFY_USER_PROMPT
                         },
                         {
                             "type": "image_url",
