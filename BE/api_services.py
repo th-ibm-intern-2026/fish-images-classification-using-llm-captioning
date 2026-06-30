@@ -1,29 +1,31 @@
 from flask import Flask, request, jsonify
-from watsonx_captioning import convert_image_to_base64, get_fish_description_from_watsonxai, get_json_generated_image_details, get_json_generated_image_details_gemini, get_json_generated_image_details_groq
+from watsonx_captioning import get_fish_description_from_watsonxai, get_json_generated_image_details, get_json_generated_image_details_gemini, get_json_generated_image_details_groq
 from elasticsearch_query import ElasticsearchQuery
 from embedding_service import EmbeddingService
 from function import return_top_n_fish, return_top_n_fish_simple, return_fish_info
 from generation import get_generated_response, get_generated_response_with_context
 import os
 import time
+import json
+import threading
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import ibm_boto3
 from ibm_botocore.client import Config
-import io
 import logging
 from groq import Groq
 import base64
 import traceback
-from fish_services import get_watsonx_token, identify_fish_candidates, identify_fish_candidates_gemini, identify_fish_candidates_gemini2, identify_fish_candidates_gemini2, identify_fish_candidates_groq
+from fish_services import get_watsonx_token, identify_fish_candidates, identify_fish_candidates_gemini2, identify_fish_candidates_groq
 from anthropic_captioning import (
     get_anthropic_client,
     caption_image_anthropic,
     identify_fish_details_anthropic,
     identify_fish_candidates_anthropic,
-    rerank_candidates_haiku_text,
-    is_fish_image_anthropic,
 )
+from openrouter_captioning import is_fish_image_openrouter, locate_fish_bbox_qwen, crop_b64_to_fish, cap_image_b64
 from deepseek_captioning import rerank_candidates_deepseek
+from concurrent.futures import ThreadPoolExecutor
 from google import genai
 
 
@@ -44,7 +46,6 @@ client = genai.Client(api_key=_gemini_key) if _gemini_key else None
 _groq_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=_groq_key) if _groq_key else None
 
-# env
 watsonx_api_key = os.getenv("WATSONX_APIKEY", None)
 ibm_cloud_url = os.getenv("IBM_CLOUD_URL", None)
 project_id = os.getenv("PROJECT_ID", None)
@@ -73,11 +74,86 @@ def available_providers():
 _available = available_providers()
 ACTIVE_PROVIDER = _available[0] if _available else "anthropic"
 
-# /identify_and_search Pass-2 reranker. "deepseek" matches the caption TEXT against
-# the shortlist (cheaper + higher top-1 in benchmarking) but never sees the image;
-# "anthropic" re-sends the image to the vision model (also runs the non-fish gate).
-# DeepSeek falls back to the Anthropic vision rerank if it errors or isn't configured.
+# /identify_and_search Pass-2 reranker. The reranker re-scores the ES shortlist
+# against the caption TEXT (it never sees the image). RERANK_PROVIDER selects the
+# backend from RERANK_FUNCS below; to drop in a better model later, add one entry
+# to that map (a fn taking (caption, candidates) and returning the shared
+# text-rerank shape) and point RERANK_PROVIDER at it — no other code changes. Set
+# it to anything not in the map (e.g. "none") to skip rerank and serve ES order.
 RERANK_PROVIDER = os.getenv("RERANK_PROVIDER", "deepseek").lower()
+RERANK_FUNCS = {
+    "deepseek": rerank_candidates_deepseek,
+}
+
+# Open-set / out-of-corpus gate for /identify_and_search. The gallery is tiny
+# (~91 species), so a fish that is not in the database still maps to its nearest
+# neighbors and reranks confidently. We flag (don't drop) low-confidence matches so
+# the caller can route the image to the open-ended /search_possible_fish pipeline.
+#
+# Signal: ES has strong top-N recall (the true species is usually among the first
+# few candidates even when it's not #1), so we trust the best per-candidate
+# rerank match_score across the top IDENTIFY_TOP_N results rather than only the
+# reranker's single best pick. On real out-of-corpus data, top match_score >= 0.40
+# flags ~73% of unknowns while keeping ~73% of real in-DB fish confident (~27%
+# false-flagged) -- the balanced operating point. Lower IDENTIFY_MATCH_MIN to 0.30 to
+# rarely bother correct IDs (~47% caught / ~9% false-flag); raise it to catch more
+# unknowns. NOTE: the gate is a MAX over the top-N, and the reranker orders results
+# best-first, so IDENTIFY_TOP_N has little effect in practice -- the threshold is the
+# real lever.
+IDENTIFY_TOP_N = int(os.getenv("IDENTIFY_TOP_N", "5"))
+IDENTIFY_MATCH_MIN = float(os.getenv("IDENTIFY_MATCH_MIN", "0.40"))
+# Opt-in: when not confident, internally call the open-ended vision identifier and
+# attach its output as open_search_results. Off by default (keeps latency/cost flat).
+IDENTIFY_AUTO_FALLBACK = os.getenv("IDENTIFY_AUTO_FALLBACK", "0") == "1"
+# Where to append the caption of each flagged out-of-corpus fish (JSONL, append-only)
+# for later review / DB seeding. Logging is best-effort and never breaks the response.
+UNKNOWN_FISH_LOG = os.getenv("UNKNOWN_FISH_LOG", os.path.join(os.path.dirname(__file__), "unknown_fish_captions.jsonl"))
+_unknown_log_lock = threading.Lock()
+
+
+def log_unknown_fish(entry):
+    """Append one flagged-unknown record as a JSON line. Best-effort: any failure is
+    logged and swallowed so a disk/permission issue can never fail the request."""
+    try:
+        line = json.dumps(entry, ensure_ascii=False)
+        with _unknown_log_lock, open(UNKNOWN_FISH_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as log_e:
+        app.logger.warning(f"Could not log unknown fish caption: {log_e}")
+
+# --- Identification provider dispatch ---------------------------------------
+# The two identification endpoints (/image_identification, /search_possible_fish)
+# pick a provider by ACTIVE_PROVIDER. The underlying provider functions already
+# return the same shape per operation, but their call signatures differ (some take
+# a client, watsonx-candidates needs a token fetch first). These adapters normalize
+# every provider to a uniform (b64) -> dict so the endpoints can dispatch through a
+# single registry lookup. To add/swap a provider: write its function, wrap it here,
+# add one map entry. An unknown ACTIVE_PROVIDER is a None lookup -> explicit error.
+
+
+def _candidates_watsonx(b64):
+    """WatsonX candidates adapter: fetch the IAM token, then identify."""
+    token = get_watsonx_token(watsonx_api_key, ibm_cloud_iam_url)
+    if not token:
+        raise RuntimeError("WatsonX authentication failed: could not get access token")
+    return identify_fish_candidates(b64, token, project_id, chat_url)
+
+
+# Single best match -> {"image_contains_fish", "fish_details"}
+IDENTIFY_DETAILS_FUNCS = {
+    "anthropic": identify_fish_details_anthropic,
+    "gemini": lambda b64: get_json_generated_image_details_gemini(client, b64),
+    "groq": lambda b64: get_json_generated_image_details_groq(groq_client, b64),
+    "watsonx": get_json_generated_image_details,
+}
+
+# Top-5 candidates -> {"image_contains_fish", "rejection_reason", "observed_features", "results"}
+IDENTIFY_CANDIDATES_FUNCS = {
+    "anthropic": identify_fish_candidates_anthropic,
+    "gemini": lambda b64: identify_fish_candidates_gemini2(client, b64),
+    "groq": lambda b64: identify_fish_candidates_groq(groq_client, b64),
+    "watsonx": _candidates_watsonx,
+}
 
 app = Flask(__name__)
 
@@ -129,7 +205,6 @@ def search():
 
         caption_embedding = emb.embed_text(text_input)
         hits = esq.search_embedding(index_name=index_name, embedding_field='physical_description_embedding', query_vector=caption_embedding, size=5)
-        # top_n_fish = return_top_n_fish(hits, n=5)
         top_n_fish = return_top_n_fish_simple(hits, n=5)
         return jsonify({"input": text_input, "results": top_n_fish})
     except Exception as e:
@@ -149,11 +224,12 @@ def image_captioning():
             app.logger.error("No image provided in request")
             return jsonify({"error": "No image provided"}), 400
 
-        # COS fetch + base64 block (image is a COS object key)
+        # COS fetch + base64 block (image is a COS object key). Cap the long edge
+        # before captioning (downscale-only) to trim upload bytes and billed pixels.
         try:
             app.logger.info(f"Fetching image from COS: {image}")
             image_bytes = fetch_image_from_cos(image)
-            pic_string = base64.b64encode(image_bytes).decode('utf-8')
+            pic_string = cap_image_b64(base64.b64encode(image_bytes).decode('utf-8'))
         except Exception as cos_e:
             traceback.print_exc()
             app.logger.error(f"COS fetch error: {cos_e}")
@@ -202,18 +278,12 @@ def image_identification():
 
         # Vision model call block
         try:
-            if ACTIVE_PROVIDER == "anthropic":
-              app.logger.info("Calling Anthropic (Claude) for image identification")
-              json_result = identify_fish_details_anthropic(pic_string)
-            elif ACTIVE_PROVIDER == "gemini":
-              app.logger.info("Calling Gemini for image identification")
-              json_result = get_json_generated_image_details_gemini(client, pic_string)
-            elif ACTIVE_PROVIDER == "watsonx":
-              app.logger.info("Calling WatsonX for image identification")
-              json_result = get_json_generated_image_details(pic_string)
-            else:
-              app.logger.info("Calling Groq for image identification")
-              json_result = get_json_generated_image_details_groq(groq_client, pic_string)
+            identify_fn = IDENTIFY_DETAILS_FUNCS.get(ACTIVE_PROVIDER)
+            if identify_fn is None:
+                app.logger.error(f"Unknown ACTIVE_PROVIDER for identification: {ACTIVE_PROVIDER}")
+                return jsonify(fallback_response("image_identification", f"Unknown provider: {ACTIVE_PROVIDER}")), 500
+            app.logger.info(f"Calling {ACTIVE_PROVIDER} for image identification")
+            json_result = identify_fn(pic_string)
         except Exception as ai_e:
             traceback.print_exc()
             app.logger.error(f"Identification model error: {ai_e}")
@@ -222,7 +292,6 @@ def image_identification():
         if not json_result:
             return jsonify({"error": "AI could not identify fish (Returned None)"}), 500
 
-        print("this is json_result",json_result)
         return json_result
     except Exception as e:
         traceback.print_exc()
@@ -284,17 +353,17 @@ def search_with_scientific_name():
 
 
 
-### Below this one
-### /identify_and_search is the primary fish-identification endpoint:
-### caption -> Elasticsearch kNN -> LLM rerank (+ non-fish gate).
+# /identify_and_search is the primary fish-identification endpoint:
+# caption -> Elasticsearch kNN -> LLM rerank (+ non-fish gate).
 @app.route("/identify_and_search", methods=["POST"])
 def identify_and_search():
     """
     1. Fetches the image from COS (image = COS object key).
-    2. (Anthropic only) cheap Haiku gate to reject non-fish photos up front.
+    2. Runs the Qwen3-VL fish gate + crop localization in parallel; a non-fish
+       verdict short-circuits, otherwise the crop tightens the image to caption.
     3. Generates a descriptive caption (Anthropic or WatsonX).
     4. Semantic vector search in Elasticsearch on the caption.
-    5. LLM rerank (DeepSeek text, falling back to Haiku text) re-scores the shortlist.
+    5. DeepSeek text rerank re-scores the shortlist (ES order kept on failure).
     """
     try:
         data = request.get_json()
@@ -319,40 +388,71 @@ def identify_and_search():
         _t0 = time.perf_counter()
         _t_gate = _t_caption = _t_es = _t0
 
-        # --- STEP 1b: Cheap fish gate (Haiku) BEFORE the Sonnet caption ---
-        # The DeepSeek rerank is text-only and can't reject non-fish photos, so we
-        # screen the image up front with a small Haiku call. On a non-fish verdict we
-        # short-circuit and never pay for the Sonnet caption / search / rerank.
+        # --- STEP 1b: fish gate + crop localization, run IN PARALLEL ---
+        # Both are independent Qwen3-VL calls on the same image, so we fire them
+        # together: total latency is max(gate, crop) (~2s) instead of the sum
+        # (~3.5s). The GATE is authoritative for fish/not-fish (the DeepSeek rerank
+        # is text-only and can't reject non-fish photos); the CROP only tightens the
+        # image we caption so the fish fills more of Sonnet's fixed pixel budget.
+        # On a non-fish verdict we discard the crop and short-circuit, never paying
+        # for the Sonnet caption / search / rerank. Both run for EVERY provider
+        # (standalone OpenRouter calls), so swapping ACTIVE_PROVIDER never disables them.
+        # To swap either model, set OPENROUTER_GATE_MODEL / OPENROUTER_CROP_MODEL.
         gate_contains_fish = None  # gate verdict, threaded into the final response
-        if ACTIVE_PROVIDER == "anthropic":
-            try:
-                gate = is_fish_image_anthropic(pic_string)
-                if isinstance(gate, dict):
-                    gate_contains_fish = gate.get("image_contains_fish")
-                if gate_contains_fish is False:
-                    app.logger.info(f"Image rejected by fish gate: {gate.get('rejection_reason')}")
-                    return jsonify({
-                        "ai_generated_caption": None,
-                        "observed_features": None,
-                        "elasticsearch_results": None,
-                        "reranked_results": None,
-                        "rerank_error": None,
-                        "image_contains_fish": False,
-                        "rejection_reason": gate.get("rejection_reason"),
-                    })
-            except Exception as gate_e:
-                # Gate failure must not block a valid fish; log and continue to captioning.
-                app.logger.warning(f"Fish gate check failed, continuing: {gate_e}")
+        caption_input = pic_string  # full image unless cropping succeeds
+        pool = ThreadPoolExecutor(max_workers=2)
+        gate_future = pool.submit(is_fish_image_openrouter, pic_string)
+        crop_future = pool.submit(locate_fish_bbox_qwen, pic_string)
+
+        rejection = None
+        try:
+            gate = gate_future.result()
+            if isinstance(gate, dict):
+                gate_contains_fish = gate.get("image_contains_fish")
+            if gate_contains_fish is False:
+                rejection = gate.get("rejection_reason")
+        except Exception as gate_e:
+            # Gate failure must not block a valid fish; log and continue to captioning.
+            app.logger.warning(f"Fish gate check failed, continuing: {gate_e}")
+
+        if rejection is not None:
+            pool.shutdown(wait=False)  # don't block the response on the now-useless crop
+            app.logger.info(f"Image rejected by fish gate: {rejection}")
+            return jsonify({
+                "ai_generated_caption": None,
+                "observed_features": None,
+                "elasticsearch_results": None,
+                "reranked_results": None,
+                "rerank_error": None,
+                "image_contains_fish": False,
+                "rejection_reason": rejection,
+            })
+
+        # Gate passed (or failed open): use the crop to tighten the captioned image.
+        # crop_b64_to_fish returns the full image unchanged on a null/tiny box, so
+        # cropping can only ever help — a localization miss never drops the fish.
+        try:
+            bbox = crop_future.result()
+            caption_input = crop_b64_to_fish(pic_string, bbox)
+            if caption_input != pic_string:
+                app.logger.info("Captioning the cropped fish region.")
+        except Exception as crop_e:
+            app.logger.warning(f"Fish crop failed, using full image: {crop_e}")
+        pool.shutdown(wait=False)
+        # Cap the long edge before captioning. The vision model downscales larger
+        # images anyway, so this trims upload bytes (and Sonnet's billed pixels)
+        # with negligible detail loss. Downscale-only: no-op if already within cap.
+        caption_input = cap_image_b64(caption_input)
         _t_gate = time.perf_counter()
 
         # --- STEP 2: Image Captioning (Pass 1) ---
         try:
             if ACTIVE_PROVIDER == "anthropic":
                 app.logger.info("Calling Anthropic (Claude) for image captioning (Pass 1)")
-                caption = caption_image_anthropic(pic_string)
+                caption = caption_image_anthropic(caption_input)
             else:
                 app.logger.info("Calling WatsonX for image captioning (Pass 1)")
-                caption = get_fish_description_from_watsonxai(pic_string)
+                caption = get_fish_description_from_watsonxai(caption_input)
             app.logger.info(f"Generated Caption: {caption[:100]}...")
             if not caption:
                 return jsonify({"error": "AI failed to generate a caption"}), 500
@@ -385,32 +485,24 @@ def identify_and_search():
         reranked = None
         observed_features = None
         rerank_error = None
-        # Seed with the Haiku gate verdict (True once we got past the gate). The vision
-        # rerank path can still override it below; the text rerank path keeps the gate's
-        # answer since it never sees the image. None means "no verdict available".
         image_contains_fish = gate_contains_fish
         rejection_reason = None
-        if ACTIVE_PROVIDER == "anthropic":
-            rr = None
-            # Preferred path: DeepSeek text rerank (caption vs. shortlist, no image).
-            if RERANK_PROVIDER == "deepseek":
-                try:
-                    app.logger.info("Reranking ES shortlist with DeepSeek (text) Pass 2.")
-                    rr = rerank_candidates_deepseek(caption, top_n_fish)
-                except Exception as ds_e:
-                    traceback.print_exc()
-                    app.logger.warning(f"DeepSeek rerank failed, falling back to Anthropic vision: {ds_e}")
-                    rerank_error = f"deepseek: {ds_e}"
-            # Fallback path: Haiku TEXT rerank (same caption-vs-shortlist logic, no image).
-            if rr is None:
-                try:
-                    app.logger.info("Reranking ES shortlist with Haiku (text) Pass 2.")
-                    rr = rerank_candidates_haiku_text(caption, top_n_fish)
-                    rerank_error = None  # Haiku text rerank recovered after a DeepSeek miss
-                except Exception as rr_e:
-                    traceback.print_exc()
-                    app.logger.error(f"Rerank error in identify_and_search: {rr_e}")
-                    rerank_error = str(rr_e)
+        # Rerank runs whenever the caption provider actually exists (a caption was
+        # produced to rerank) — it is NOT tied to Anthropic. The reranker is chosen by
+        # RERANK_PROVIDER (see RERANK_FUNCS); on any failure, or when RERANK_PROVIDER
+        # names no known backend, we leave the ES ordering as-is rather than fall back
+        # to another model. If no caption provider is configured there's nothing to rerank.
+        rerank_fn = RERANK_FUNCS.get(RERANK_PROVIDER)
+        if ACTIVE_PROVIDER in available_providers() and rerank_fn is not None:
+            try:
+                app.logger.info(f"Reranking ES shortlist with {RERANK_PROVIDER} (text) Pass 2.")
+                rr = rerank_fn(caption, top_n_fish)
+            except Exception as rr_e:
+                # Reranker failed: keep the Elasticsearch results, no rerank.
+                traceback.print_exc()
+                app.logger.warning(f"{RERANK_PROVIDER} rerank failed, returning Elasticsearch results: {rr_e}")
+                rerank_error = f"{RERANK_PROVIDER}: {rr_e}"
+                rr = None
             if isinstance(rr, dict):
                 reranked = rr.get("results")
                 observed_features = rr.get("observed_features")
@@ -420,8 +512,54 @@ def identify_and_search():
                     image_contains_fish = rr.get("image_contains_fish")
                     rejection_reason = rr.get("rejection_reason")
         else:
-            app.logger.info("Rerank skipped: active provider is not anthropic.")
+            app.logger.info(f"Rerank skipped: no caption provider configured or unknown RERANK_PROVIDER '{RERANK_PROVIDER}'.")
         _t_rerank = time.perf_counter()
+
+        # --- STEP 5: Open-set verdict (is this fish actually in the database?) ---
+        # ES has strong top-N recall, so we trust the BEST per-candidate rerank
+        # match_score across the top IDENTIFY_TOP_N results: confident if it clears
+        # IDENTIFY_MATCH_MIN. We FLAG but never drop the ranked list; the caller routes
+        # unknowns to /search_possible_fish.
+        top_scores = [r.get("rerank_score") for r in (reranked or [])[:IDENTIFY_TOP_N]
+                      if r.get("rerank_score") is not None]
+        top_match_score = max(top_scores) if top_scores else None
+        match_confidence = top_match_score  # the value that drives the decision
+
+        # Fail open: if the reranker produced no scores at all (e.g. an outage), don't
+        # force a false unknown -- treat it as confident and let the ranked list stand.
+        have_signal = top_match_score is not None
+        confident_match = bool((not have_signal) or top_match_score >= IDENTIFY_MATCH_MIN)
+        possible_new_species = not confident_match
+        suggested_endpoint = "/search_possible_fish" if possible_new_species else None
+
+        # Persist the caption of flagged unknowns as JSONL for later review / DB seeding.
+        if possible_new_species:
+            log_unknown_fish({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "match_confidence": match_confidence,
+                "ai_generated_caption": caption,
+                "observed_features": observed_features,
+                # Top guesses we rejected -- useful context when reviewing the unknown.
+                "top_candidates": [
+                    {"fish_name": r.get("fish_name"), "scientific_name": r.get("scientific_name"),
+                     "rerank_score": r.get("rerank_score"), "score": r.get("score")}
+                    for r in (reranked or [])[:IDENTIFY_TOP_N]
+                ],
+            })
+
+        # Opt-in: self-serve the open-ended identifier so a single call returns guesses.
+        # Provider-agnostic: dispatch through the same registry the /search_possible_fish
+        # endpoint uses, so it follows ACTIVE_PROVIDER instead of hardcoding one model.
+        open_search_results = None
+        if possible_new_species and IDENTIFY_AUTO_FALLBACK:
+            identify_fn = IDENTIFY_CANDIDATES_FUNCS.get(ACTIVE_PROVIDER)
+            if identify_fn is not None:
+                try:
+                    app.logger.info("Low confidence: running open-ended /search_possible_fish identifier.")
+                    open_search_results = identify_fn(caption_input)
+                except Exception as of_e:
+                    traceback.print_exc()
+                    app.logger.warning(f"Open-set auto-fallback failed: {of_e}")
 
         print(
             "[identify_and_search TIMING] "
@@ -440,6 +578,12 @@ def identify_and_search():
             "rerank_error": rerank_error,
             "image_contains_fish": image_contains_fish,
             "rejection_reason": rejection_reason,
+            # Open-set verdict: flag (don't drop) likely out-of-corpus fish.
+            "match_confidence": match_confidence,  # best rerank match_score over top-N (drives the verdict)
+            "confident_match": confident_match,
+            "possible_new_species": possible_new_species,
+            "suggested_endpoint": suggested_endpoint,
+            "open_search_results": open_search_results,
         })
 
     except Exception as e:
@@ -476,34 +620,17 @@ def search_possible_fish():
             return jsonify({"error": f"Failed to fetch image: {str(cos_error)}"}), 500
 
         # 3. Call the vision model (active provider)
-        ai_result = None
+        identify_fn = IDENTIFY_CANDIDATES_FUNCS.get(ACTIVE_PROVIDER)
+        if identify_fn is None:
+            app.logger.error(f"Unknown ACTIVE_PROVIDER for identification: {ACTIVE_PROVIDER}")
+            return jsonify({"error": f"Unknown provider: {ACTIVE_PROVIDER}"}), 500
+        print(f"Using {ACTIVE_PROVIDER} model for identification")
+        ai_result = identify_fn(pic_base64)
 
-        if ACTIVE_PROVIDER == "anthropic":
-          print("Using Anthropic (Claude) model for identification")
-          ai_result = identify_fish_candidates_anthropic(pic_base64)
-        elif ACTIVE_PROVIDER == "gemini":
-          print("Using Gemini model for identification")
-          ai_result = identify_fish_candidates_gemini2(client, pic_base64)
-        elif ACTIVE_PROVIDER == "watsonx":
-          print("Using WatsonX model for identification")
-          access_token = get_watsonx_token(watsonx_api_key, ibm_cloud_iam_url)
-          if not access_token:
-            app.logger.error("Authentication failed: Could not get WatsonX token")
-            return jsonify({"error": "Authentication failed"}), 500
-          ai_result = identify_fish_candidates(pic_base64, access_token, project_id, chat_url)
-        else:
-          # Groq needs no WatsonX token.
-          ai_result = identify_fish_candidates_groq(groq_client, pic_base64)
-
-
-        print("this is ai_result",ai_result)
-
-        # เช็คว่า AI ตอบกลับมาจริงไหม
         if not ai_result:
             app.logger.error("AI returned None or failed to parse JSON")
             return jsonify({"error": "AI could not identify fish"}), 500
 
-        # Return ทั้งก้อน (Full Object)
         return jsonify(ai_result), 200
 
     except Exception as e:

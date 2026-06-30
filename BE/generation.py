@@ -1,37 +1,14 @@
 import os
 from dotenv import load_dotenv
-from ibm_watsonx_ai import APIClient, Credentials
-from ibm_watsonx_ai.foundation_models import ModelInference
-from ibm_watsonx_ai.foundation_models.utils import Toolkit
+
+from deepseek_captioning import chat_deepseek
 
 # --- Initialization (can be done once) ---
 load_dotenv()
 
-credentials = Credentials(
-    url=os.getenv("WATSONXAI_URL"),
-    api_key=os.getenv("WATSONX_APIKEY"),
-)
-
-model_id = "meta-llama/llama-3-3-70b-instruct"
-
-parameters = {
-    "frequency_penalty": 0,
-    "max_tokens": 2000,
-    "presence_penalty": 0,
-    "temperature": 0,
-    "top_p": 1
-}
-
-project_id = os.getenv("PROJECT_ID")
-space_id = os.getenv("SPACE_ID")
-
-model = ModelInference(
-    model_id=model_id,
-    params=parameters,
-    credentials=credentials,
-    project_id=project_id,
-    space_id=space_id
-)
+# Chat/generation runs on DeepSeek (model from DEEPSEEK_MODEL, default deepseek-v4-flash).
+CHAT_MAX_TOKENS = 2000
+CHAT_TEMPERATURE = 0
 # --- End Initialization ---
 
 from embedding_service import EmbeddingService
@@ -121,13 +98,9 @@ def get_generated_response(question: str, chat_history: list = None):
         chat_messages.extend(recent_history)
     chat_messages.append({"role": "user", "content": user_prompt})
 
-    response = model.chat(messages=chat_messages)
+    response = chat_deepseek(chat_messages, max_tokens=CHAT_MAX_TOKENS, temperature=CHAT_TEMPERATURE)
     print("Raw model response:", response)
-
-    if response and "choices" in response and len(response["choices"]) > 0:
-        return response["choices"][0]["message"].get("content", "Error: Could not extract generated text.")
-    else:
-        return "Error: Invalid response from model."
+    return response or "Error: Invalid response from model."
 
 def get_generated_response_with_context(question: str, context: str, chat_history: list = None):
     """
@@ -171,13 +144,9 @@ def get_generated_response_with_context(question: str, context: str, chat_histor
     chat_messages.append({"role": "user", "content": user_prompt})
 
     try:
-        response = model.chat(messages=chat_messages)
+        response = chat_deepseek(chat_messages, max_tokens=CHAT_MAX_TOKENS, temperature=CHAT_TEMPERATURE)
         print("Raw model response:", response)
-
-        if response and "choices" in response and len(response["choices"]) > 0:
-            return response["choices"][0]["message"].get("content", "Error: Could not extract generated text.")
-        else:
-            return "Error: Invalid response from model."
+        return response or "Error: Invalid response from model."
     except Exception as e:
         print(f"Error generating response: {e}")
         return f"Error: Failed to generate response - {str(e)}"

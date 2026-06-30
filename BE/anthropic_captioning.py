@@ -15,22 +15,12 @@ import os
 
 import anthropic
 
-from fish_constants import SYSTEM_CONTENT_SINGLE, CAPTION_MATCH_SYSTEM, CAPTION_MATCH_USER
-from text_rerank import TEXT_RERANK_SYSTEM, build_user_prompt, parse_json_object, shape_results
+from fish_constants import SYSTEM_CONTENT_OPEN, SYSTEM_CONTENT_DETAILS, CAPTION_MATCH_SYSTEM, CAPTION_MATCH_USER
 
-# Sonnet 4.6 — strong vision at a lower cost than Opus. Override with ANTHROPIC_MODEL.
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-# Per-stage models for the two-pass /identify_and_search pipeline:
-#   describe (Pass 1) -> Sonnet for accurate feature reading;
-#   rerank  (Pass 2) -> Haiku, cheaper and sufficient to re-order a shortlist.
-# Both fall back to MODEL and are overridable per-deployment.
+# Pass-1 caption model for /identify_and_search; falls back to MODEL, overridable.
 CAPTION_MODEL = os.getenv("ANTHROPIC_CAPTION_MODEL", MODEL)
-RERANK_MODEL = os.getenv("ANTHROPIC_RERANK_MODEL", "claude-haiku-4-5")
-# Cheap up-front gate: a small Haiku call that only decides "is this a fish?" before
-# the more expensive Sonnet caption runs (and before the text-only DeepSeek rerank,
-# which never sees the image and so can't reject non-fish photos).
-GATE_MODEL = os.getenv("ANTHROPIC_GATE_MODEL", "claude-haiku-4-5")
 
 _client = None
 
@@ -71,13 +61,6 @@ def _image_block(b64):
 
 
 def _cached_system(text):
-    """Wrap a system prompt as a cacheable content block (Anthropic prompt caching).
-
-    The big identifier prompt (all reference descriptions) is byte-stable across
-    requests, so caching it serves it at ~0.1x input cost on warm hits. The image
-    lives in the user message, after this breakpoint, so it never invalidates the
-    cache. TTL is 5 min — effective once request traffic is steady.
-    """
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
@@ -97,33 +80,7 @@ def _parse_json_object(text):
 # so /identify_and_search matches like-for-like (see fish_constants.CAPTION_MATCH_SYSTEM).
 _CAPTION_SYSTEM = CAPTION_MATCH_SYSTEM
 
-_DETAILS_SYSTEM = """
-You are an expert Ichthyologist and AI assistant specializing in marine biology and
-taxonomy, particularly species found in Thailand. Analyze the image and return a
-strictly formatted JSON response.
-
---- STEP 1: VALIDATION ---
-Set "image_contains_fish" to false if the image shows: cooked food; processed fish
-(fillets, dried, head removed); non-realistic images (cartoons, drawings); or is too
-blurry to identify.
-
---- STEP 2: GENERATION ---
-If valid, fill in the schema below.
-
---- OUTPUT SCHEMA ---
-Return ONLY a raw JSON object (no markdown, no ```json fences):
-{
-    "image_contains_fish": <boolean>,
-    "fish_details": {
-        "fish_name": "<Common name in English>",
-        "scientific_name": "<Scientific Latin name>",
-        "order_name": "<Taxonomic Order>",
-        "physical_description": "<3-5 sentences: body shape, scale patterns, coloration, fin characteristics, distinct anatomical features>",
-        "habitat": "<environments, water depth, water type, behavior>"
-    }
-}
-If "image_contains_fish" is false, "fish_details" must be an empty object {}.
-"""
+_DETAILS_SYSTEM = SYSTEM_CONTENT_DETAILS
 
 
 _FISH_GATE_SYSTEM = (
@@ -135,28 +92,6 @@ _FISH_GATE_SYSTEM = (
     'Output ONLY JSON (no markdown): {"image_contains_fish": <true|false>, '
     '"rejection_reason": <short reason string, or null if it is a fish>}.'
 )
-
-
-def is_fish_image_anthropic(b64, model=None):
-    """Cheap Haiku gate: does this image show an identifiable fish?
-
-    Returns {"image_contains_fish": bool, "rejection_reason": str|None}. Meant to run
-    before the Sonnet caption so non-fish images are rejected early and cheaply.
-    """
-    client = get_anthropic_client()
-    resp = client.messages.create(
-        model=model or GATE_MODEL,
-        max_tokens=200,
-        system=_FISH_GATE_SYSTEM,
-        messages=[{
-            "role": "user",
-            "content": [
-                _image_block(b64),
-                {"type": "text", "text": "Is this an identifiable fish? Return the JSON object."},
-            ],
-        }],
-    )
-    return _parse_json_object(_response_text(resp))
 
 
 def caption_image_anthropic(b64, model=None):
@@ -193,29 +128,12 @@ def identify_fish_details_anthropic(b64):
     return _parse_json_object(_response_text(resp))
 
 
-def rerank_candidates_haiku_text(caption, candidates, model=None):
-    """TEXT-only Haiku fallback reranker (no image), mirroring the DeepSeek path.
-
-    Matches the 7-field caption text against the candidate descriptions using the SAME
-    shared prompt/shaping as rerank_candidates_deepseek, so the fallback is regularized
-    with the primary path. Returns the shared text-rerank shape.
-    """
-    client = get_anthropic_client()
-    resp = client.messages.create(
-        model=model or RERANK_MODEL,
-        max_tokens=2048,
-        system=TEXT_RERANK_SYSTEM,
-        messages=[{"role": "user", "content": build_user_prompt(caption, candidates)}],
-    )
-    return shape_results(caption, candidates, parse_json_object(_response_text(resp)))
-
-
 def identify_fish_candidates_anthropic(b64):
     client = get_anthropic_client()
     resp = client.messages.create(
         model=MODEL,
         max_tokens=2048,
-        system=_cached_system(SYSTEM_CONTENT_SINGLE),  # cache the all-species prompt
+        system=_cached_system(SYSTEM_CONTENT_OPEN),  # cache the open identifier prompt
         messages=[{
             "role": "user",
             "content": [
