@@ -25,13 +25,17 @@ parameters = {
 project_id = os.getenv("PROJECT_ID")
 space_id = os.getenv("SPACE_ID")
 
-model = ModelInference(
-    model_id=model_id,
-    params=parameters,
-    credentials=credentials,
-    project_id=project_id,
-    space_id=space_id
-)
+try:
+    model = ModelInference(
+        model_id=model_id,
+        params=parameters,
+        credentials=credentials,
+        project_id=project_id,
+        space_id=space_id
+    )
+except Exception as _watsonx_init_err:
+    print(f"WatsonX ModelInference not available (missing credentials): {_watsonx_init_err}")
+    model = None
 # --- End Initialization ---
 
 from embedding_service import EmbeddingService
@@ -121,6 +125,9 @@ def get_generated_response(question: str, chat_history: list = None):
         chat_messages.extend(recent_history)
     chat_messages.append({"role": "user", "content": user_prompt})
 
+    if model is None:
+        return "Error: WatsonX model is not available (missing credentials)."
+
     response = model.chat(messages=chat_messages)
     print("Raw model response:", response)
 
@@ -171,6 +178,9 @@ def get_generated_response_with_context(question: str, context: str, chat_histor
     chat_messages.append({"role": "user", "content": user_prompt})
 
     try:
+        if model is None:
+            return "Error: WatsonX model is not available (missing credentials)."
+
         response = model.chat(messages=chat_messages)
         print("Raw model response:", response)
 

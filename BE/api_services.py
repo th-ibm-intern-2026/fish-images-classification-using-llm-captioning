@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from watsonx_captioning import convert_image_to_base64, get_fish_description_from_watsonxai, get_json_generated_image_details, get_json_generated_image_details_gemini, get_json_generated_image_details_groq
+from watsonx_captioning import convert_image_to_base64, get_fish_description_from_watsonxai, get_json_generated_image_details
 from elasticsearch_query import ElasticsearchQuery
 from embedding_service import EmbeddingService
 from function import return_top_n_fish, return_top_n_fish_simple, return_fish_info
@@ -10,29 +10,32 @@ import ibm_boto3
 from ibm_botocore.client import Config
 import io
 import logging
-from groq import Groq
 import base64
 import traceback
-from fish_services import get_watsonx_token, identify_fish_candidates, identify_fish_candidates_gemini, identify_fish_candidates_gemini2, identify_fish_candidates_gemini2, identify_fish_candidates_groq
-from google import genai
+from fish_services import get_watsonx_token, identify_fish_candidates, identify_fish_candidates_anthropic
 
 
 load_dotenv()
+COS_BUCKET_NAME = os.environ.get('IBM_COS_BUCKET_NAME', 'fish-image-bucket')
 es_endpoint = os.environ["es_endpoint"]
 es_username = os.environ["es_username"]
 es_password = os.environ["es_password"]
+
+def get_cos_client():
+    """Create an IBM COS client using HMAC credentials (same as Hono API)."""
+    access_key = os.environ.get('IBM_COS_ACCESS_KEY_ID')
+    secret_key = os.environ.get('IBM_COS_SECRET_ACCESS_KEY')
+    auth_endpoint = os.environ.get('IBM_AUTH_ENDPOINT', '')
+    endpoint_url = auth_endpoint if auth_endpoint.startswith('https://') else f'https://{auth_endpoint}'
+    return ibm_boto3.client(
+        's3',
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        endpoint_url=endpoint_url,
+    )
 index_name = 'fish_index_v4'    
 esq = ElasticsearchQuery(es_endpoint, es_username, es_password)
 emb = EmbeddingService('watsonx')
-
-global USE_GEMINI
-USE_GEMINI = False 
-
-client = genai.Client(
-  api_key=os.getenv("GEMINI_API_KEY")
-)
-
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # env
 watsonx_api_key = os.getenv("WATSONX_APIKEY", None)
@@ -87,33 +90,15 @@ def image_captioning():
 
         # COS fetch block
         try:
-            app.logger.info("loading COS credentials")
-            api_key = os.environ.get('IBM_COS_API_KEY')
-            resource_instance_id = os.environ.get('IBM_COS_RESOURCE_INSTANCE_ID')
-            endpoint_url = os.environ.get('IBM_COS_ENDPOINT')
-            cos = ibm_boto3.client(
-                's3',
-                ibm_api_key_id=api_key,
-                ibm_service_instance_id=resource_instance_id,
-                config=Config(signature_version='oauth'),
-                endpoint_url=endpoint_url
-            )
-            app.logger.info(f"Fetching image from COS: {image}")
-            response = cos.get_object(Bucket='fish-image-bucket', Key=image)
+            app.logger.info("Fetching image from COS")
+            cos = get_cos_client()
+            response = cos.get_object(Bucket=COS_BUCKET_NAME, Key=image)
             image_bytes = response['Body'].read()
+            pic_string = base64.b64encode(image_bytes).decode('utf-8')
         except Exception as cos_e:
             traceback.print_exc()
             app.logger.error(f"COS fetch error: {cos_e}")
             return jsonify(fallback_response("image_captioning", f"COS fetch error: {cos_e}")), 503
-
-        # Base64 conversion block
-        try:
-            app.logger.info("Converting image to base64")
-            pic_string = base64.b64encode(image_bytes).decode('utf-8')
-        except Exception as b64_e:
-            traceback.print_exc()
-            app.logger.error(f"Base64 conversion error: {b64_e}")
-            return jsonify(fallback_response("image_captioning", f"Base64 error: {b64_e}")), 503
 
         # WatsonX call block
         try:
@@ -142,19 +127,9 @@ def image_identification():
 
         # COS fetch block
         try:
-            app.logger.info("loading COS credentials")
-            api_key = os.environ.get('IBM_COS_API_KEY')
-            resource_instance_id = os.environ.get('IBM_COS_RESOURCE_INSTANCE_ID')
-            endpoint_url = os.environ.get('IBM_COS_ENDPOINT')
-            cos = ibm_boto3.client(
-                's3',
-                ibm_api_key_id=api_key,
-                ibm_service_instance_id=resource_instance_id,
-                config=Config(signature_version='oauth'),
-                endpoint_url=endpoint_url
-            )
-            app.logger.info(f"Fetching image from COS: {image}")
-            response = cos.get_object(Bucket='fish-image-bucket', Key=image)
+            app.logger.info("Fetching image from COS")
+            cos = get_cos_client()
+            response = cos.get_object(Bucket=COS_BUCKET_NAME, Key=image)
             image_bytes = response['Body'].read()
         except Exception as cos_e:
             traceback.print_exc()
@@ -170,15 +145,10 @@ def image_identification():
             app.logger.error(f"Base64 conversion error: {b64_e}")
             return jsonify(fallback_response("image_captioning", f"Base64 error: {b64_e}")), 503
 
-        # WatsonX call block
+        # AI call block
         try:
-            # json_result = get_json_generated_image_details(pic_string)
-            if USE_GEMINI:
-              app.logger.info("Calling Gemini for image captioning")
-              json_result = get_json_generated_image_details_gemini(client, pic_string)
-            else:
-              app.logger.info("Calling WatsonX for image captioning")
-              json_result = get_json_generated_image_details_groq(groq_client, pic_string)
+            app.logger.info("Calling WatsonX for image captioning")
+            json_result = get_json_generated_image_details(pic_string)
         except Exception as ai_e:
             traceback.print_exc()
             app.logger.error(f"WatsonX error: {ai_e}")
@@ -268,20 +238,11 @@ def identify_and_search():
 
         app.logger.info(f"Starting 2-step process for image: {image}")
 
-        # --- STEP 1: Fetch Image and Encode (Code copied from /image_captioning) ---
+        # --- STEP 1: Fetch Image and Encode ---
         try:
-            app.logger.info("Loading COS credentials and fetching image.")
-            api_key = os.environ.get('IBM_COS_API_KEY')
-            resource_instance_id = os.environ.get('IBM_COS_RESOURCE_INSTANCE_ID')
-            endpoint_url = os.environ.get('IBM_COS_ENDPOINT')
-            cos = ibm_boto3.client(
-                's3',
-                ibm_api_key_id=api_key,
-                ibm_service_instance_id=resource_instance_id,
-                config=Config(signature_version='oauth'),
-                endpoint_url=endpoint_url
-            )
-            response = cos.get_object(Bucket='fish-image-bucket', Key=image)
+            app.logger.info("Fetching image from COS.")
+            cos = get_cos_client()
+            response = cos.get_object(Bucket=COS_BUCKET_NAME, Key=image)
             image_bytes = response['Body'].read()
             pic_string = base64.b64encode(image_bytes).decode('utf-8')
         except Exception as cos_e:
@@ -348,20 +309,8 @@ def search_possible_fish():
 
         # 2. Fetch Image from IBM COS
         try:
-            api_key = os.environ.get('IBM_COS_API_KEY')
-            resource_instance_id = os.environ.get('IBM_COS_RESOURCE_INSTANCE_ID')
-            endpoint_url = os.environ.get('IBM_COS_ENDPOINT')
-            bucket_name = 'fish-image-bucket' 
-
-            cos = ibm_boto3.client(
-                's3',
-                ibm_api_key_id=api_key,
-                ibm_service_instance_id=resource_instance_id,
-                config=Config(signature_version='oauth'),
-                endpoint_url=endpoint_url
-            )
-            
-            response = cos.get_object(Bucket=bucket_name, Key=image_key)
+            cos = get_cos_client()
+            response = cos.get_object(Bucket=COS_BUCKET_NAME, Key=image_key)
             image_bytes = response['Body'].read()
             pic_base64 = base64.b64encode(image_bytes).decode("utf-8")
             
@@ -369,21 +318,8 @@ def search_possible_fish():
             app.logger.error(f"COS Error: {cos_error}")
             return jsonify({"error": f"Failed to fetch image: {str(cos_error)}"}), 500
 
-        # 3. Get Token & Call AI (Using fish_service)
-        access_token = get_watsonx_token(watsonx_api_key, ibm_cloud_iam_url)
-        if not access_token:
-            app.logger.error("Authentication failed: Could not get WatsonX token")
-            return jsonify({"error": "Authentication failed"}), 500
-
-        # เรียก AI
-        ai_result = None
-
-        if USE_GEMINI:
-          print("Using Gemini model for identification")
-          ai_result = identify_fish_candidates_gemini2(client, pic_base64)
-        else:
-          # ai_result = identify_fish_candidates(pic_base64, access_token, project_id, chat_url)
-          ai_result = identify_fish_candidates_groq(groq_client, pic_base64)
+        # 3. Call AI for fish identification
+        ai_result = identify_fish_candidates_anthropic(pic_base64)
           
 
         print("this is ai_result",ai_result)
@@ -401,16 +337,5 @@ def search_possible_fish():
         app.logger.error(f"Unhandled Error: {str(e)}")
         return jsonify(fallback_response("search_possible_fish", str(e))), 500
 
-@app.route("/changeModel", methods=["GET"])
-def change_use_gemini():
-    global USE_GEMINI
-    USE_GEMINI = not USE_GEMINI
-    app.logger.info(f"USE_GEMINI set to: {USE_GEMINI}")
-    return jsonify({"USE_GEMINI": USE_GEMINI}), 200
-
-@app.route("/isGemini", methods=["GET"])
-def is_gemini():
-    global USE_GEMINI
-    return jsonify({"USE_GEMINI": USE_GEMINI}), 200
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8080, debug=True)
