@@ -4,8 +4,8 @@ import os
 import re
 import anthropic
 import http.client
+from groq import Groq
 from typing import Dict, Any, Optional
-from fish_constants import SYSTEM_CONTENT_SINGLE
 
 from fish_constants import SYSTEM_CONTENT_OPEN, MODEL_ID
 from google import genai
@@ -88,7 +88,6 @@ def identify_fish_candidates(pic_string: str, access_token: str, project_id: str
         return None
 
 
-def identify_fish_candidates_anthropic(pic_string: str) -> Optional[Dict[str, Any]]:
 def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> Optional[Dict[str, Any]]:
     """
     Analyzes a base64 encoded image to identify fish species using Gemini.
@@ -193,64 +192,42 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
 def identify_fish_candidates_groq(client: Groq, pic_string: str) -> Optional[Dict[str, Any]]:
 
     """
-    Identifies marine organisms from a base64-encoded image using Anthropic Claude vision.
-    Returns scientific names for any identifiable species (fish, octopus, jellyfish, etc.)
+    Identifies marine organisms from a base64-encoded image using Groq's vision model.
+    Returns the open-ended Top-5 candidates shape ({"image_contains_fish",
+    "rejection_reason", "results"}) with SCIENTIFIC names, matching the other
+    candidate providers.
     """
-    try:
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    # Groq Vision model (OpenAI-compatible chat.completions API).
+    groq_model_id = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
-        message = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=SYSTEM_CONTENT_SINGLE,
+    try:
+        completion = client.chat.completions.create(
+            model=groq_model_id,
             messages=[
+                {"role": "system", "content": SYSTEM_CONTENT_OPEN},
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/webp",
-                                "data": pic_string,
-                    "role": "system",
-                    # Important: For JSON mode to work, the word "JSON" must appear in the system prompt
-                    "content": "You are a fish identification expert. Output strictly in JSON format. "
-                               + SYSTEM_CONTENT_OPEN
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": IDENTIFY_USER_PROMPT
-                        },
+                        {"type": "text", "text": IDENTIFY_USER_PROMPT},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                # Groq accepts data URLs for base64 images
-                                "url": f"data:image/jpeg;base64,{pic_string}"
-                            },
+                            # Groq accepts data URLs for base64 images.
+                            "image_url": {"url": f"data:image/jpeg;base64,{pic_string}"},
                         },
-                        {
-                            "type": "text",
-                            "text": "Analyze this image. Identify the marine organism (fish, cephalopod, crustacean, marine mammal, prehistoric species, etc.) and return JSON with Top 5 candidates using scientific names."
-                        }
                     ],
-                }
+                },
             ],
+            temperature=0.0,
+            max_tokens=4096,
+            # JSON mode forces structured output (SYSTEM_CONTENT_OPEN already says "JSON").
+            response_format={"type": "json_object"},
         )
 
-        ai_response = message.content[0].text
-        print("▼▼▼▼▼▼ ANTHROPIC RAW OUTPUT ▼▼▼▼▼▼")
-        print(ai_response[:500])
-        print("▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲")
-
+        ai_response = completion.choices[0].message.content
         json_match = re.search(r'\{.*\}', ai_response, re.DOTALL)
         clean_json_str = json_match.group(0) if json_match else ai_response.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json_str)
 
     except Exception as e:
-        print(f"Anthropic API Request Error: {e}")
+        print(f"Groq API Request Error: {e}")
         return None

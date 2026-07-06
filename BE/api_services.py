@@ -12,7 +12,7 @@ import io
 import logging
 import base64
 import traceback
-from fish_services import get_watsonx_token, identify_fish_candidates, identify_fish_candidates_anthropic
+from fish_services import get_watsonx_token, identify_fish_candidates
 
 
 load_dotenv()
