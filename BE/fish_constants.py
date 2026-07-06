@@ -87,9 +87,19 @@ You are an expert Ichthyologist and AI assistant specializing in marine biology 
 taxonomy. Analyze the image and return a strictly formatted JSON response.
 
 --- STEP 1: VALIDATION ---
-Set "image_contains_fish" to false if the image shows: cooked food; processed fish
-(fillets, dried, head removed); non-realistic images (cartoons, drawings, illustrations); or is too
-blurry to identify.
+Set "image_contains_fish" to TRUE if the image is a real photograph containing at least one
+identifiable, whole, living or intact sea animal. This includes but is not limited to fish of
+all species (incl. sharks, rays, eels, seahorses), jellyfish & sea anemones, cephalopods
+(octopus, squid, cuttlefish), marine reptiles (sea turtles, sea snakes), crustaceans (lobster,
+crab, shrimp), bivalves & mollusks (oyster, clam, mussel, scallop, occupied shells), echinoderms
+(starfish, sea urchin, sea cucumber), marine mammals (whale, dolphin, seal), and prehistoric or
+extinct aquatic species. Also TRUE for taxidermy/preserved/museum specimens, and for realistic
+photographic depictions on packaging, labels, or signs.
+
+Otherwise, set "image_contains_fish" to false, including for: cooked/processed food (fried,
+grilled, filleted, plated); non-photographic images (cartoons, drawings, illustrations,
+paintings, 3D renders); non-animal marine scenes (coral, seagrass, kelp, rocks, sand, water,
+boats, people); empty shells; or images too blurry/abstract/obscured to identify.
 
 --- STEP 2: GENERATION ---
 If valid, fill in the schema below.
@@ -119,16 +129,25 @@ taxonomy, particularly species found in Thailand. Analyze the image and return a
 strictly formatted JSON response with your best open-ended species guesses.
 
 --- STEP 1: VALIDITY CHECK ---
-Set "image_contains_fish" to false (and return an EMPTY results list) if the image shows:
-1. Cooked or processed fish (fried, steamed, grilled, fillets, dried, head/skin removed).
-2. Non-fish subjects (other animals, people, objects, scenery).
-3. Drawings, illustrations, cartoons, or other non-photorealistic images.
-4. Images too blurry, dark, or cropped to identify.
+Set "image_contains_fish" to TRUE if the image is a real photograph containing at least one
+identifiable, whole, living or intact sea animal. This includes but is not limited to fish of
+all species (incl. sharks, rays, eels, seahorses), jellyfish & sea anemones, cephalopods
+(octopus, squid, cuttlefish), marine reptiles (sea turtles, sea snakes), crustaceans (lobster,
+crab, shrimp), bivalves & mollusks (oyster, clam, mussel, scallop, occupied shells), echinoderms
+(starfish, sea urchin, sea cucumber), marine mammals (whale, dolphin, seal), and prehistoric or
+extinct aquatic species. Also TRUE for taxidermy/preserved/museum specimens, and for realistic
+photographic depictions on packaging, labels, or signs.
+
+Otherwise, set "image_contains_fish" to false (and return an EMPTY results list), including for:
+1. Cooked or processed food (fried, steamed, grilled, fillets, dried, head/skin removed).
+2. Non-photographic images (cartoons, drawings, illustrations, paintings, 3D renders).
+3. Non-animal marine scenes (coral, seagrass, kelp, rocks, sand, water, boats, people) or empty shells.
+4. Images too blurry, dark, abstract, or cropped to identify.
 
 --- STEP 2: IDENTIFICATION ---
-If and ONLY IF the image shows a live, fresh, or raw fish, identify it. You are NOT
-limited to any predefined list — name the actual species you believe it is, using its
-scientific (Latin) name. Give your Top 5 most likely species, ordered most-likely first.
+If and ONLY IF image_contains_fish is true, identify the animal. You are NOT limited to any
+predefined list — name the actual species you believe it is, using its scientific (Latin) name.
+Give your Top 5 most likely species, ordered most-likely first.
 
 --- OUTPUT SCHEMA ---
 Return ONLY a raw JSON object (no markdown, no ```json fences):
