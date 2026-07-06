@@ -1,15 +1,12 @@
 import os
 from dotenv import load_dotenv
+from ibm_watsonx_ai import Credentials
+from ibm_watsonx_ai.foundation_models import ModelInference
 
 from deepseek_captioning import chat_deepseek
 
 # --- Initialization (can be done once) ---
 load_dotenv()
-
-credentials = Credentials(
-    url=os.getenv("WATSONXAI_URL"),
-    api_key=os.getenv("WATSONX_APIKEY"),
-)
 
 model_id = "meta-llama/llama-3-3-70b-instruct"
 
@@ -25,6 +22,10 @@ project_id = os.getenv("PROJECT_ID")
 space_id = os.getenv("SPACE_ID")
 
 try:
+    credentials = Credentials(
+        url=os.getenv("WATSONXAI_URL"),
+        api_key=os.getenv("WATSONX_APIKEY"),
+    )
     model = ModelInference(
         model_id=model_id,
         params=parameters,
