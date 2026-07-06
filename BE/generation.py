@@ -6,6 +6,35 @@ from deepseek_captioning import chat_deepseek
 # --- Initialization (can be done once) ---
 load_dotenv()
 
+credentials = Credentials(
+    url=os.getenv("WATSONXAI_URL"),
+    api_key=os.getenv("WATSONX_APIKEY"),
+)
+
+model_id = "meta-llama/llama-3-3-70b-instruct"
+
+parameters = {
+    "frequency_penalty": 0,
+    "max_tokens": 2000,
+    "presence_penalty": 0,
+    "temperature": 0,
+    "top_p": 1
+}
+
+project_id = os.getenv("PROJECT_ID")
+space_id = os.getenv("SPACE_ID")
+
+try:
+    model = ModelInference(
+        model_id=model_id,
+        params=parameters,
+        credentials=credentials,
+        project_id=project_id,
+        space_id=space_id
+    )
+except Exception as _watsonx_init_err:
+    print(f"WatsonX ModelInference not available (missing credentials): {_watsonx_init_err}")
+    model = None
 # Chat/generation runs on DeepSeek (model from DEEPSEEK_MODEL, default deepseek-v4-flash).
 CHAT_MAX_TOKENS = 2000
 CHAT_TEMPERATURE = 0
@@ -98,6 +127,10 @@ def get_generated_response(question: str, chat_history: list = None):
         chat_messages.extend(recent_history)
     chat_messages.append({"role": "user", "content": user_prompt})
 
+    if model is None:
+        return "Error: WatsonX model is not available (missing credentials)."
+
+    response = model.chat(messages=chat_messages)
     response = chat_deepseek(chat_messages, max_tokens=CHAT_MAX_TOKENS, temperature=CHAT_TEMPERATURE)
     print("Raw model response:", response)
     return response or "Error: Invalid response from model."
@@ -144,6 +177,10 @@ def get_generated_response_with_context(question: str, context: str, chat_histor
     chat_messages.append({"role": "user", "content": user_prompt})
 
     try:
+        if model is None:
+            return "Error: WatsonX model is not available (missing credentials)."
+
+        response = model.chat(messages=chat_messages)
         response = chat_deepseek(chat_messages, max_tokens=CHAT_MAX_TOKENS, temperature=CHAT_TEMPERATURE)
         print("Raw model response:", response)
         return response or "Error: Invalid response from model."

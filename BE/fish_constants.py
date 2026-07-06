@@ -34,6 +34,44 @@ CAPTION_MATCH_SYSTEM = (
 )
 CAPTION_MATCH_USER = "Describe the fish in this image using the template."
 
+
+# --- System Prompt ---
+SYSTEM_CONTENT_SINGLE = f"""
+You are an expert marine biologist with comprehensive knowledge of ALL aquatic and marine organisms.
+
+--- KNOWN SPECIES DESCRIPTIONS FOR REFERENCE (use for visual matching guidance, not as a hard limit) ---
+{FISH_BASE_DESCRIPTION}
+--- END REFERENCE DESCRIPTIONS ---
+
+STEP 1: DECIDE — set "image_contains_fish" to true or false.
+
+✅ Set "image_contains_fish" to TRUE for ANY identifiable sea animal, including but not limited to:
+  - Fish (all species, including sharks, rays, eels, seahorses)
+  - Jellyfish & sea anemones
+  - Octopus & squid (cephalopods)
+  - Turtle & sea snakes (marine reptiles)
+  - Lobster, crab, shrimp (crustaceans)
+  - Oyster, clam, mussel, scallop, shell (bivalves & mollusks)
+  - Starfish, sea urchin, sea cucumber (echinoderms)
+  - Whale, dolphin, seal (marine mammals)
+  - Prehistoric or extinct aquatic species
+  - 3D renders, illustrations, fossils, or reconstructions of any of the above
+
+❌ Set "image_contains_fish" to FALSE (and return empty results) ONLY for:
+  - **Cooked/processed food:** Organism already prepared for eating (fried, grilled, filleted, served on a plate)
+  - **Stone/hard coral:** Sessile colonial organisms like brain coral, staghorn coral, table coral — with NO identifiable animals present
+  - **Marine plants:** Seagrass, kelp, algae, mangroves — with NO identifiable animals present
+  - **Completely non-animal:** Rocks, sand, water, people, boats, etc. — with NO identifiable animals present
+  - **Unidentifiable:** Too blurry, abstract, or obscured to determine any species
+
+STEP 2: IDENTIFICATION (only if image_contains_fish is true)
+1. Use your full marine biology knowledge — NOT limited to the reference list above.
+2. Identify the top 5 most likely species using ALL visible features.
+3. Output the **scientific name** for each (e.g. "Octopus vulgaris", "Chelonia mydas", "Panulirus argus").
+
+Output Requirements:
+Produce ONLY valid JSON. No markdown fences.
+=======
 # --- Details identification prompt (/image_identification) ---
 # Single shared prompt for the per-provider details functions (anthropic/gemini/groq/
 # watsonx) so they all return the SAME {image_contains_fish, fish_details} shape and
@@ -93,8 +131,16 @@ real common name. Give your Top 5 most likely species, ordered most-likely first
 Return ONLY a raw JSON object (no markdown, no ```json fences):
 {
     "image_contains_fish": <true|false>,
-    "rejection_reason": <string or null, e.g. "Image contains cooked food">,
+    "rejection_reason": <string or null, reason if false>,
     "results": [
+        // Empty [] if image_contains_fish is false.
+        // Exactly 5 objects if image_contains_fish is true:
+        {{
+            "fish_name": <string, SCIENTIFIC NAME e.g. "Octopus vulgaris">,
+            "score": <float 0.0-1.0>,
+            "score_reason": <string, brief visual explanation>
+        }}
+=======
         {
             "fish_name": <string, common name of the species>,
             "score": <float, 0.0-1.0, your confidence>,
