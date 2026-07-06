@@ -1,96 +1,106 @@
-import csv
-import os
-
 # --- Configuration ---
 MODEL_ID = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
-# MODEL_ID =  "meta-llama/llama-3-2-90b-vision-instruct";
-CSV_FILENAME = "Marine_Fish_Possible_Output.csv"
 
-def load_fish_data_from_csv():
-    """
-    Reads the CSV file from the same directory and returns:
-    1. A list of allowed species names.
-    2. A formatted text description string.
-    """
-    allowed_species = []
-    description_lines = []
-    
-    # Locate CSV file relative to this script
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(base_dir, CSV_FILENAME)
+# --- Shared structured-feature template ---
+# These are the exact fields EXTRACTION/physical_description_service.py uses to author
+# every species' "Physical Description" in the reference data. The caption step reads
+# the image with the SAME fields so the embedding match is like-for-like.
+PHYSICAL_FEATURE_FIELDS = [
+    "body_shape",
+    "primary_colors",
+    "secondary_colors",
+    "markings",
+    "dorsal_fin",
+    "caudal_fin",
+    "unique_features",
+]
 
-    if not os.path.exists(file_path):
-        # Fallback if file is missing (to prevent crash on import)
-        print(f"⚠️ Warning: '{CSV_FILENAME}' not found in {base_dir}")
-        return [], ""
+# --- Caption prompt for /identify_and_search (image -> caption -> embed -> ES) ---
+# The ES physical_description_embedding is now built from 7-field descriptions
+# (EXTRACTION/physical_description_service.py). Emitting the caption in the SAME
+# 7-field shape (no species name) makes the vector match like-for-like instead of
+# matching free prose against structured text.
+CAPTION_MATCH_SYSTEM = (
+    "You are an expert ichthyologist describing a fish from a photo for visual "
+    "database matching. Describe ONLY what is clearly visible. Do not name the "
+    "species. Do not use markdown, JSON, or line breaks. Output EXACTLY one line "
+    "using this template, keeping the field labels:\n"
+    "body_shape: <fusiform, laterally compressed, dorsoventrally flattened, or elongated>; "
+    "primary_colors: <dominant body colors>; secondary_colors: <accent colors on belly or highlights>; "
+    "markings: <patterns like stripes, bars, or spots AND their location on the body>; "
+    "dorsal_fin: <shape and colors/patterns>; caudal_fin: <shape such as forked, rounded, squared, AND colors>; "
+    "unique_features: <highly visible diagnostic markers>\n"
+    'Write "not clearly visible" for any field the photo does not show. Do not invent sizes or measurements.'
+)
+CAPTION_MATCH_USER = "Describe the fish in this image using the template."
 
-    try:
-        with open(file_path, 'r', newline='', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            
-            # Check for required columns
-            if 'Fish Name' not in reader.fieldnames or 'Physical Description' not in reader.fieldnames:
-                print("⚠️ Error: CSV is missing 'Fish Name' or 'Physical Description' columns.")
-                return [], ""
+# --- Details identification prompt (/image_identification) ---
+# Single shared prompt for the per-provider details functions (anthropic/gemini/groq/
+# watsonx) so they all return the SAME {image_contains_fish, fish_details} shape and
+# the SAME language. Structured wording follows the Anthropic version; the
+# physical_description and habitat fields are written in THAI for the Thai-facing app
+# (names/scientific/order stay English).
+SYSTEM_CONTENT_DETAILS = """
+You are an expert Ichthyologist and AI assistant specializing in marine biology and
+taxonomy, particularly species found in Thailand. Analyze the image and return a
+strictly formatted JSON response.
 
-            for row in reader:
-                name = row['Fish Name'].strip()
-                desc = row['Physical Description'].strip()
-                
-                if name and desc:
-                    allowed_species.append(name)
-                    # Format: "FishName Description"
-                    description_lines.append(f"{name} {desc}")
-                    
-        return allowed_species, "\n".join(description_lines)
+--- STEP 1: VALIDATION ---
+Set "image_contains_fish" to false if the image shows: cooked food; processed fish
+(fillets, dried, head removed); non-realistic images (cartoons, drawings); or is too
+blurry to identify.
 
-    except Exception as e:
-        print(f"⚠️ Error loading fish constants: {e}")
-        return [], ""
+--- STEP 2: GENERATION ---
+If valid, fill in the schema below.
 
-# --- Load Data on Module Import ---
-ALLOWED_FISH_SPECIES, FISH_BASE_DESCRIPTION = load_fish_data_from_csv()
+--- OUTPUT SCHEMA ---
+Return ONLY a raw JSON object (no markdown, no ```json fences):
+{
+    "image_contains_fish": <boolean>,
+    "fish_details": {
+        "fish_name": "<Common name in English>",
+        "scientific_name": "<Scientific Latin name>",
+        "order_name": "<Taxonomic Order>",
+        "physical_description": "<3-5 sentences IN THAI: body shape, scale patterns, coloration, fin characteristics, distinct anatomical features>",
+        "habitat": "<IN THAI: environments, water depth, water type, behavior>"
+    }
+}
+If "image_contains_fish" is false, "fish_details" must be an empty object {}.
+"""
 
-# --- System Prompt ---
-SYSTEM_CONTENT_SINGLE = f"""
-You are an expert Ichthyologist and AI assistant. 
+# --- Open-ended candidates prompt (/search_possible_fish + identify_and_search fallback) ---
+# Used when a fish is likely NOT one of the in-database species, so the model makes a
+# free, open-ended guess. NOT constrained to any allowed list — it names the actual
+# species it believes the fish is.
+SYSTEM_CONTENT_OPEN = """
+You are an expert Ichthyologist and AI assistant specializing in marine biology and
+taxonomy, particularly species found in Thailand. Analyze the image and return a
+strictly formatted JSON response with your best open-ended species guesses.
 
-Allowed species list (exact English names): {', '.join(ALLOWED_FISH_SPECIES)}
+--- STEP 1: VALIDITY CHECK ---
+Set "image_contains_fish" to false (and return an EMPTY results list) if the image shows:
+1. Cooked or processed fish (fried, steamed, grilled, fillets, dried, head/skin removed).
+2. Non-fish subjects (other animals, people, objects, scenery).
+3. Drawings, cartoons, or other non-photorealistic images.
+4. Images too blurry, dark, or cropped to identify.
 
---- BASE PHYSICAL DESCRIPTIONS FOR REFERENCE ---
-{FISH_BASE_DESCRIPTION}
---- END REFERENCE DESCRIPTIONS ---
+--- STEP 2: IDENTIFICATION ---
+If and ONLY IF the image shows a live, fresh, or raw fish, identify it. You are NOT
+limited to any predefined list — name the actual species you believe it is, using its
+real common name. Give your Top 5 most likely species, ordered most-likely first.
 
-Your task is to analyze the image using the following strict logic:
-
-STEP 1: VALIDITY CHECK (CRITICAL)
-Before attempting to identify species, analyze the image context.
-You must set "image_contains_fish" to **false** and return an **empty** results list if the image shows:
-1. **Cooked Food:** Fried, steamed, grilled, baked, or sauced fish (e.g., golden brown crust, garnishes, served on a dinner plate).
-2. **Processed Fish:** Fillets, dried fish, or fish with heads/skin removed.
-3. **Non-Fish:** Objects that are clearly not marine animals.
-4. **Drawings/Cartoons:** Non-photorealistic images.
-
-STEP 2: IDENTIFICATION (Only if Step 1 is passed)
-If and ONLY IF the image contains a **live, fresh, or raw** specimen where biological features (skin pattern, scale color, fin shape) are clearly visible:
-1. Compare visual features against the **BASE PHYSICAL DESCRIPTIONS**.
-2. Select the **Top 5** most likely species.
-
-Output Requirements:
-Produce ONLY valid JSON.
-
-Schema:
-{{
+--- OUTPUT SCHEMA ---
+Return ONLY a raw JSON object (no markdown, no ```json fences):
+{
     "image_contains_fish": <true|false>,
     "rejection_reason": <string or null, e.g. "Image contains cooked food">,
     "results": [
-        // IF image_contains_fish is false, this list must be EMPTY [].
-        // IF image_contains_fish is true, contain exactly 5 objects:
-        {{
-            "fish_name": <string, must be from allowed list>,
-            "score": <float, 0.0-1.0>,
-            "score_reason": <string, brief explanation of visual match>
-        }}
+        {
+            "fish_name": <string, common name of the species>,
+            "score": <float, 0.0-1.0, your confidence>,
+            "score_reason": <string, the visible features that led to this guess>
+        }
     ]
-}}
+}
+If "image_contains_fish" is false, "results" must be an empty list [].
 """

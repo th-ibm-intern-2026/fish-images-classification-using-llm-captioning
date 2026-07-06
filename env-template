@@ -2,8 +2,10 @@ CE_API_BASE_URL =
 CE_PROJECT_ID =
 CE_REGION =
 PROJECT_ID=
+SPACE_ID=
 WATSONX_APIKEY=
 WATSONXAI_URL=
+IBM_CLOUD_URL=
 IAM_IBM_CLOUD_URL=iam.cloud.ibm.com
 IBM_WATSONX_AI_INFERENCE_URL=https://us-south.ml.cloud.ibm.com/ml/v1/text/chat?version=2023-05-29
 es_endpoint=
@@ -14,5 +16,26 @@ EMBEDDING_SERVICE_URL=
 IBM_COS_API_KEY=
 IBM_COS_RESOURCE_INSTANCE_ID=
 IBM_COS_ENDPOINT=
+IBM_COS_BUCKET=fish-image-bucket
 GEMINI_API_KEY=
 GROQ_API_KEY=
+ANTHROPIC_API_KEY=
+ANTHROPIC_MODEL=claude-sonnet-4-6
+DEEPSEEK_API_KEY=
+# Pass-2 reranker for /identify_and_search. Selects a backend from RERANK_FUNCS
+# in api_services.py (currently "deepseek"). Add a new entry there to swap in a
+# better model; set this to an unknown value (e.g. "none") to skip rerank and
+# serve the Elasticsearch order.
+RERANK_PROVIDER=deepseek
+# OpenRouter powers the cheap up-front fish gate (Qwen3-VL-8B-Instruct) for
+# /identify_and_search, independent of the captioning provider (ACTIVE_PROVIDER).
+# The same model also grounds (bounding-boxes) the fish for the optional crop,
+# run in parallel with the gate. OPENROUTER_GATE_MODEL / OPENROUTER_CROP_MODEL
+# override each model (both default qwen/qwen3-vl-8b-instruct).
+OPENROUTER_API_KEY=
+OPENROUTER_GATE_MODEL=qwen/qwen3-vl-8b-instruct
+OPENROUTER_CROP_MODEL=qwen/qwen3-vl-8b-instruct
+# Long-edge cap (px) applied to the image before the captioning vision call.
+# The model downscales larger images anyway; 1344 trims upload bytes and billed
+# vision tokens with negligible detail loss. Set to 0 to disable the cap.
+CAPTION_MAX_EDGE=1344

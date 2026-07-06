@@ -9,7 +9,7 @@ def create_embedding_csv(output_path):
     import csv
     input_csv = "./DATA/fish-description-files/Marine_Fish_Species_Full_Description_test.csv"
     fish_names = []
-    with open(input_csv, newline='', encoding='utf-8') as csvfile:
+    with open(input_csv, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
             fish_names.append(row["Fish Name"])

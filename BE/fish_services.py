@@ -1,4 +1,3 @@
-# fish_service.py
 import base64
 import json
 import re
@@ -6,9 +5,17 @@ from groq import Groq
 import requests
 import http.client
 from typing import Dict, Any, Optional
-from fish_constants import SYSTEM_CONTENT_SINGLE, MODEL_ID
+from fish_constants import SYSTEM_CONTENT_OPEN, MODEL_ID
 from google import genai
 from google.genai import types
+
+# Shared instruction for every provider: make an open-ended guess (not limited to any
+# list) and return the Top 5 most likely species with the visible features behind each.
+IDENTIFY_USER_PROMPT = (
+    "Identify the fish species in the image. You are not limited to any list — give your "
+    "best open-ended guess. Return JSON with your Top 5 most likely species, each with a "
+    "confidence score and the visible features behind the guess."
+)
 
 def get_watsonx_token(api_key: str, iam_url: str) -> Optional[str]:
     try:
@@ -41,11 +48,11 @@ def identify_fish_candidates(pic_string: str, access_token: str, project_id: str
     
     body = {
         "messages": [
-            {"role": "system", "content": SYSTEM_CONTENT_SINGLE},
+            {"role": "system", "content": SYSTEM_CONTENT_OPEN},
             {
                 "role": "user", 
                 "content": [
-                    {"type": "text", "text": "Identify the fish. Return JSON with Top 5 candidates."},
+                    {"type": "text", "text": IDENTIFY_USER_PROMPT},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{pic_string}"}}
                 ]
             }
@@ -83,44 +90,6 @@ def identify_fish_candidates(pic_string: str, access_token: str, project_id: str
         print(f"AI Request Error: {e}")
         return None
 
-def identify_fish_candidates_gemini(client: genai.Client, pic_string: str) -> Optional[Dict[str, Any]]:
-    try:
-        # Decode base64 เป็น bytes
-        try:
-            image_bytes = base64.b64decode(pic_string)
-        except Exception as e:
-            print(f"Error decoding base64: {e}")
-            return None
-
-        # Config Gemini
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-            system_instruction=SYSTEM_CONTENT_SINGLE, # ใช้ Prompt ตัวเดียวกัน
-            max_output_tokens=4096
-        )
-
-        # Call API
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part.from_bytes(
-                  data=image_bytes,
-                  mime_type="image/jpeg"
-                ),
-                'Identify the fish in this image'
-            ],
-            config=config
-        )
-        
-        if response.text:
-            return json.loads(response.text)
-        return None
-
-    except Exception as e:
-        print(f"Gemini Error: {e}")
-        return None
-
 def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> Optional[Dict[str, Any]]:
     """
     Analyzes a base64 encoded image to identify fish species using Gemini.
@@ -131,38 +100,38 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
     # 1. Define Schemas (Strict Output Control)
     # ---------------------------------------------------------
     
-    # Schema สำหรับปลาแต่ละตัวใน list 'results'
+    # Schema for each candidate in the 'results' list
     candidate_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
             "fish_name": types.Schema(
-                type=types.Type.STRING, 
-                description="Must be exactly one from the allowed species list."
+                type=types.Type.STRING,
+                description="Common name of the identified species (open-ended, not from any list)."
             ),
             "score": types.Schema(
-                type=types.Type.NUMBER, 
+                type=types.Type.NUMBER,
                 description="Confidence score between 0.0 and 1.0"
             ),
             "score_reason": types.Schema(
-                type=types.Type.STRING, 
-                description="Brief explanation of visual features matching the description."
+                type=types.Type.STRING,
+                description="The visible features that led to this guess."
             )
         },
         required=["fish_name", "score", "score_reason"]
     )
 
-    # Schema หลักของ JSON Response
+    # Top-level JSON response schema
     main_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
             "image_contains_fish": types.Schema(
-                type=types.Type.BOOLEAN, 
+                type=types.Type.BOOLEAN,
                 description="True only if valid, raw/fresh fish is detected."
             ),
             "rejection_reason": types.Schema(
-                type=types.Type.STRING, 
+                type=types.Type.STRING,
                 description="Reason if image_contains_fish is false, otherwise null.",
-                nullable=True # อนุญาตให้เป็น null ได้
+                nullable=True
             ),
             "results": types.Schema(
                 type=types.Type.ARRAY,
@@ -184,13 +153,11 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
             print(f"Error decoding base64: {e}")
             return None
 
-        # Config Gemini
-        # หมายเหตุ: SYSTEM_CONTENT_SINGLE ต้องเป็น f-string ที่ render ค่าตัวแปรมาครบแล้ว
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=main_schema, # 👈 หัวใจสำคัญ: บังคับโครงสร้าง
-            temperature=0.1,             # ต่ำเพื่อให้ AI แม่นยำเรื่องชื่อและข้อมูล
-            system_instruction=SYSTEM_CONTENT_SINGLE, 
+            response_schema=main_schema,  # force the output structure
+            temperature=0.1,              # low temperature for accurate names/info
+            system_instruction=SYSTEM_CONTENT_OPEN,
             max_output_tokens=4096
         )
 
@@ -202,24 +169,15 @@ def identify_fish_candidates_gemini2(client: genai.Client, pic_string: str) -> O
                     data=image_bytes,
                     mime_type="image/webp"
                 ),
-                # ย้ำ Prompt สั้นๆ อีกครั้งเพื่อให้ AI เริ่มทำงาน
-                'Analyze the image. Return JSON according to the schema.'
+                IDENTIFY_USER_PROMPT
             ],
             config=config
         )
         
         # Parse Response
-        # เพราะเราใช้ schema + application/json จึงมั่นใจได้ว่า text เป็น json แน่นอน
         if response.text:
             try:
-                # 1. แปลง String เป็น Python Dict
                 parsed_json = json.loads(response.text)
-                
-                # 2. Print แบบจัดระเบียบ (Pretty Print)
-                print("▼▼▼▼▼▼ GEMINI JSON OUTPUT ▼▼▼▼▼▼")
-                print(json.dumps(parsed_json, indent=4, ensure_ascii=False))
-                print("▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲")
-                
                 return parsed_json
             except json.JSONDecodeError as e:
                 print(f"Error parsing JSON from Gemini: {e}")
@@ -248,15 +206,15 @@ def identify_fish_candidates_groq(client: Groq, pic_string: str) -> Optional[Dic
                 {
                     "role": "system",
                     # Important: For JSON mode to work, the word "JSON" must appear in the system prompt
-                    "content": "You are a fish identification expert. Output strictly in JSON format. " 
-                               + SYSTEM_CONTENT_SINGLE  # Replace with your actual variable
+                    "content": "You are a fish identification expert. Output strictly in JSON format. "
+                               + SYSTEM_CONTENT_OPEN
                 },
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "text", 
-                            "text": "Identify the fish. Return JSON with Top 5 candidates."
+                            "type": "text",
+                            "text": IDENTIFY_USER_PROMPT
                         },
                         {
                             "type": "image_url",
