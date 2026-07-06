@@ -20,14 +20,12 @@ class ElasticsearchQuery:
                 - "all": all indices categorized
         """
         try:
-            # Fixed: Use keyword argument
             user_index = []
             system_index = []
             indices = self.es.indices.get_alias()
             for index_name in indices.keys():
                 count = self.get_document_count(index_name, silent=True)
                 if not(index_name.startswith('.')):
-                    # print(f"  - {index_name} ({count} documents)")
                     user_index.append(index_name)
                 else:
                     system_index.append(index_name)
@@ -40,19 +38,7 @@ class ElasticsearchQuery:
                 return indices.keys()
         except Exception as e:
             print(f"✗ Error listing indices: {e}")
-    
-    # def get_document_count_from_index(self, index_name, silent=False):
-    #     try:
-    #         response = self.es.count(index=index_name)
-    #         count = response['count']
-    #         if not silent:
-    #             print(f"📊 Index '{index_name}' contains {count} documents")
-    #         return count
-    #     except Exception as e:
-    #         if not silent:
-    #             print(f"✗ Error getting document count: {e}")
-    #         return 0
-  
+
     def search_text(self, index_name, field, text, size=10):
         """Search text in specific field"""
         try:

@@ -1,8 +1,7 @@
 import os
 from dotenv import load_dotenv
-from ibm_watsonx_ai import APIClient, Credentials
-from ibm_watsonx_ai.foundation_models import ModelInference
-from ibm_watsonx_ai.foundation_models.utils import Toolkit
+
+from deepseek_captioning import chat_deepseek
 
 # --- Initialization (can be done once) ---
 load_dotenv()
@@ -36,6 +35,9 @@ try:
 except Exception as _watsonx_init_err:
     print(f"WatsonX ModelInference not available (missing credentials): {_watsonx_init_err}")
     model = None
+# Chat/generation runs on DeepSeek (model from DEEPSEEK_MODEL, default deepseek-v4-flash).
+CHAT_MAX_TOKENS = 2000
+CHAT_TEMPERATURE = 0
 # --- End Initialization ---
 
 from embedding_service import EmbeddingService
@@ -129,12 +131,9 @@ def get_generated_response(question: str, chat_history: list = None):
         return "Error: WatsonX model is not available (missing credentials)."
 
     response = model.chat(messages=chat_messages)
+    response = chat_deepseek(chat_messages, max_tokens=CHAT_MAX_TOKENS, temperature=CHAT_TEMPERATURE)
     print("Raw model response:", response)
-
-    if response and "choices" in response and len(response["choices"]) > 0:
-        return response["choices"][0]["message"].get("content", "Error: Could not extract generated text.")
-    else:
-        return "Error: Invalid response from model."
+    return response or "Error: Invalid response from model."
 
 def get_generated_response_with_context(question: str, context: str, chat_history: list = None):
     """
@@ -182,12 +181,9 @@ def get_generated_response_with_context(question: str, context: str, chat_histor
             return "Error: WatsonX model is not available (missing credentials)."
 
         response = model.chat(messages=chat_messages)
+        response = chat_deepseek(chat_messages, max_tokens=CHAT_MAX_TOKENS, temperature=CHAT_TEMPERATURE)
         print("Raw model response:", response)
-
-        if response and "choices" in response and len(response["choices"]) > 0:
-            return response["choices"][0]["message"].get("content", "Error: Could not extract generated text.")
-        else:
-            return "Error: Invalid response from model."
+        return response or "Error: Invalid response from model."
     except Exception as e:
         print(f"Error generating response: {e}")
         return f"Error: Failed to generate response - {str(e)}"
